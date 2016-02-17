@@ -49,5 +49,7 @@ void cunn_RReLU_init(lua_State *L);
 void cunn_LeakyReLU_init(lua_State *L);
 void cunn_LookupTable_init(lua_State *L);
 void cunn_CrossInputNeighborhood_init(lua_State *L);
+void cunn_FlowCalculation_init(lua_State *L);
+void cunn_HistogramFlowCalculation_init(lua_State *L);
 
 #endif

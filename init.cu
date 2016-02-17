@@ -55,6 +55,8 @@ int luaopen_libcunn(lua_State *L)
   cunn_LeakyReLU_init(L);
   cunn_LookupTable_init(L);
   cunn_CrossInputNeighborhood_init(L);
-
+  cunn_FlowCalculation_init(L);
+  cunn_HistogramFlowCalculation_init(L);
+  
   return 1;
 }
