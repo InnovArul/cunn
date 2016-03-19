@@ -1,6 +1,6 @@
 #ifndef CUNN_UTILS_H
 #define CUNN_UTILS_H
-
+ 
 extern "C"
 {
 #include <lua.h>
