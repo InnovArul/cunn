@@ -244,6 +244,18 @@ function cunntest.Square_transposed()
    pointwise_transposed(nn.Square(), 'Square')
 end
 
+function cunntest.SoftShrink_forward()
+  pointwise_forward(nn.SoftShrink(math.random()), 'SoftShrink', precision_forward)
+end
+
+function cunntest.SoftShrink_backward()
+  pointwise_backward(nn.SoftShrink(math.random()), 'SoftShrink', precision_backward)
+end
+
+function cunntest.SoftShrink_transposed()
+  pointwise_transposed(nn.SoftShrink(math.random()), 'SoftShrink', precision_backward)
+end
+
 function cunntest.ELU_forward()
    pointwise_forward(nn.ELU(), 'ELU', precision_forward)
 end
@@ -499,6 +511,296 @@ function cunntest.WeightedEuclidean_backward_batch()
    mytester:assertlt(derror:abs():max(), precision_backward, 'error on diagCov (backward) ')
 end
 
+function cunntest.SparseLinear_forward()
+    local inb = math.random(5,10)
+    local ini = math.random(50,100)
+    local inj = math.random(5,10)
+
+    local module = nn.SparseLinear(ini,inj)
+    local sslin = module
+    local gslin = module:clone():cuda()
+
+    -- Create a random sparse vector
+    local input = {}
+    for i=1,inb do
+        local nnz = math.random(5, 10)
+        local inds = torch.randperm(ini)[{{1,nnz}}]
+        input[i] = torch.Tensor(nnz, 2)
+        input[i]:select(2,1):copy(inds)
+        input[i]:select(2,2):copy(torch.rand(nnz))
+    end
+
+    local tm = {}
+    local title = string.format('SparseLinear forward %d -> %d', ini, inj)
+    times[title] = tm
+
+    local groundtruth = sslin:forward(input)
+    sslin:zeroGradParameters()
+    local a = torch.Timer()
+    for i = 1,nloop do
+        groundtruth = sslin:forward(input)
+    end
+    tm.cpu = a:time().real
+
+    for i,v in ipairs(input) do input[i] = input[i]:cuda() end
+    local rescuda = gslin:forward(input)
+    gslin:zeroGradParameters()
+    a:reset()
+    for i = 1,nloop do
+        rescuda = gslin:forward(input)
+    end
+    cutorch.synchronize()
+    tm.gpu = a:time().real
+
+    local error = rescuda:float() - groundtruth
+    mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward) ')
+end
+
+function cunntest.SparseLinear_backward()
+    local inb = math.random(5,10)
+    local ini = math.random(50,100)
+    local inj = math.random(5,10)
+
+    local gslin = nn.SparseLinear(ini,inj):cuda()
+    local sslin = nn.Linear(ini,inj)
+    gslin.weight = sslin.weight:clone():cuda()
+    gslin.bias = sslin.bias:clone():cuda()
+
+    -- Create a random sparse vector
+    local input = {}
+    local nonsparse = torch.zeros(inb, ini)
+    for i=1,inb do
+        local nnz = math.random(3, 5)
+        local inds = torch.randperm(ini)[{{1,nnz}}]
+        input[i] = torch.Tensor(nnz, 2)
+        input[i]:select(2,1):copy(inds)
+        input[i]:select(2,2):copy(torch.rand(nnz))
+        nonsparse[i]:scatter(1, input[i]:select(2,1):long(), input[i]:select(2,2))
+    end
+    print(input)
+    print(nonsparse)
+
+    local tm = {}
+    local title = string.format('SparseLinear backward %d <- %d', ini, inj)
+    times[title] = tm
+
+    local gradOutput = torch.randn(inb, inj)
+    sslin:forward(nonsparse)
+    local groundgrad = sslin:backward(nonsparse, gradOutput)
+    sslin:zeroGradParameters()
+    local a = torch.Timer()
+    for i = 1,nloop do
+        sslin:backward(nonsparse, gradOutput)
+    end
+    tm.cpu = a:time().real
+    local groundweight = sslin.gradWeight
+    local groundbias = sslin.gradBias
+
+    for i,v in ipairs(input) do input[i] = input[i]:cuda() end
+    gradOutput = gradOutput:cuda()
+    gslin:forward(input)
+    local rescuda = gslin:backward(input, gradOutput)
+    gslin:zeroGradParameters()
+    a:reset()
+    for i = 1,nloop do
+        gslin:backward(input, gradOutput)
+    end
+    local weightcuda = gslin.gradWeight
+    local biascuda = gslin.gradBias
+    cutorch.synchronize()
+    tm.gpu = a:time().real
+
+    local werror = weightcuda:float() - groundweight
+    local berror = biascuda:float() - groundbias
+
+    mytester:assertlt(werror:abs():max(), precision_backward, 'error on weight (backward) ')
+    mytester:assertlt(berror:abs():max(), precision_backward, 'error on bias (backward) ')
+
+    gslin:updateParameters(.1)
+    sslin:updateParameters(.1)
+    werror = gslin.weight:float() - sslin.weight
+    berror = gslin.bias:float() - sslin.bias
+
+    mytester:assertlt(werror:abs():max(), precision_backward, 'error on weight (update) ')
+    mytester:assertlt(berror:abs():max(), precision_backward, 'error on bias (update) ')
+
+    gslin:zeroGradParameters()
+end
+
+local function BatchNormalization_forward(moduleName, dim, k)
+   local planes = torch.random(1,k)
+   local inputSize = { torch.random(2,32), planes }
+   for i=1,dim do
+      table.insert(inputSize, torch.random(1,k))
+   end
+
+   local tm = {}
+   local title = moduleName .. '.forward ' .. table.concat(inputSize, 'x')
+   times[title] = tm
+
+   local input = torch.randn(table.unpack(inputSize))
+   local sbnorm = nn[moduleName](planes)
+   local groundtruth = sbnorm:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = sbnorm:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gbnorm = nn[moduleName](planes):cuda()
+   gbnorm.weight = sbnorm.weight:cuda()
+   gbnorm.bias = sbnorm.bias:cuda()
+   local rescuda = gbnorm:forward(input)
+
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gbnorm:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward)')
+   mytester:assertlt((gbnorm.running_mean:float() - sbnorm.running_mean):abs():max(),
+      precision_forward, 'error on running_mean (forward)')
+   mytester:assertlt((gbnorm.running_var:float() - sbnorm.running_var):abs():max(),
+      precision_forward, 'error on running_var (forward)')
+end
+
+local function BatchNormalization_forward_inference(moduleName, dim, k)
+   local planes = torch.random(1,k)
+   local inputSize = { torch.random(2,32), planes }
+   for i=1,dim do
+      table.insert(inputSize, torch.random(1,k))
+   end
+
+   local tm = {}
+   local title = moduleName .. '.forward (evaluate) ' .. table.concat(inputSize, 'x')
+   times[title] = tm
+
+   local input = torch.randn(table.unpack(inputSize))
+   local sbnorm = nn[moduleName](planes)
+   sbnorm.running_mean:normal(1, 2)
+   sbnorm.running_var:uniform(1e-3, 2)
+   sbnorm:evaluate()
+   local groundtruth = sbnorm:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = sbnorm:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gbnorm = nn[moduleName](planes):cuda()
+   gbnorm:evaluate()
+   gbnorm.weight = sbnorm.weight:cuda()
+   gbnorm.bias = sbnorm.bias:cuda()
+   gbnorm.running_mean = sbnorm.running_mean:cuda()
+   gbnorm.running_var = sbnorm.running_var:cuda()
+   local rescuda = gbnorm:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gbnorm:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward evaluate)')
+end
+
+local function BatchNormalization_backward(moduleName, dim, k, backwardFn)
+   local planes = torch.random(1,k)
+   local inputSize = { torch.random(2,32), planes }
+   for i=1,dim do
+      table.insert(inputSize, torch.random(1,k))
+   end
+
+   local tm = {}
+   local title = moduleName .. '.backward ' .. table.concat(inputSize, 'x')
+   times[title] = tm
+
+   local input = torch.randn(table.unpack(inputSize))
+   local gradOutput = torch.randn(table.unpack(inputSize))
+   local sbnorm = nn[moduleName](planes)
+   sbnorm:forward(input)
+   sbnorm:zeroGradParameters()
+   local groundgrad = backwardFn(sbnorm, input, gradOutput)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      sbnorm:zeroGradParameters()
+      groundgrad = backwardFn(sbnorm, input, gradOutput)
+   end
+   local groundweight = sbnorm.gradWeight
+   local groundbias = sbnorm.gradBias
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   gradOutput = gradOutput:cuda()
+   local gbnorm = nn[moduleName](planes):cuda()
+   gbnorm.weight = sbnorm.weight:cuda()
+   gbnorm.bias = sbnorm.bias:cuda()
+   gbnorm:forward(input)
+   gbnorm:zeroGradParameters()
+   local rescuda = backwardFn(gbnorm, input, gradOutput)
+   a:reset()
+   for i = 1,nloop do
+      gbnorm:zeroGradParameters()
+      rescuda = backwardFn(gbnorm, input, gradOutput)
+   end
+   local weightcuda = gbnorm.gradWeight
+   local biascuda = gbnorm.gradBias
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundgrad
+   local werror = weightcuda:float() - groundweight
+   local berror = biascuda:float() - groundbias
+
+   mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
+   mytester:assertlt(werror:abs():max(), precision_backward, 'error on weight (backward) ')
+   mytester:assertlt(berror:abs():max(), precision_backward, 'error on bias (backward) ')
+end
+
+function cunntest.BatchNormalization()
+   BatchNormalization_forward('BatchNormalization', 0, 128)
+   BatchNormalization_forward_inference('BatchNormalization', 0, 128)
+   BatchNormalization_backward('BatchNormalization', 0, 128, function(m, input, gradOutput)
+      return m:backward(input, gradOutput)
+   end)
+   BatchNormalization_backward('BatchNormalization', 0, 128, function(m, input, gradOutput)
+      local gradInput = m:updateGradInput(input, gradOutput)
+      m:accGradParameters(input, gradOutput)
+      return gradInput
+   end)
+end
+
+function cunntest.SpatialBatchNormalization()
+   BatchNormalization_forward('SpatialBatchNormalization', 2, 64)
+   BatchNormalization_forward_inference('SpatialBatchNormalization', 2, 64)
+   BatchNormalization_backward('SpatialBatchNormalization', 2, 64, function(m, input, gradOutput)
+      return m:backward(input, gradOutput)
+   end)
+   BatchNormalization_backward('SpatialBatchNormalization', 2, 64, function(m, input, gradOutput)
+      local gradInput = m:updateGradInput(input, gradOutput)
+      m:accGradParameters(input, gradOutput)
+      return gradInput
+   end)
+end
+
+function cunntest.VolumetricBatchNormalization()
+   BatchNormalization_forward('VolumetricBatchNormalization', 3, 16)
+   BatchNormalization_forward_inference('VolumetricBatchNormalization', 3, 16)
+   BatchNormalization_backward('VolumetricBatchNormalization', 3, 16, function(m, input, gradOutput)
+      return m:backward(input, gradOutput)
+   end)
+   BatchNormalization_backward('VolumetricBatchNormalization', 3, 16, function(m, input, gradOutput)
+      local gradInput = m:updateGradInput(input, gradOutput)
+      m:accGradParameters(input, gradOutput)
+      return gradInput
+   end)
+end
 
 function cunntest.SpatialConvolutionMM_forward_single()
    local from = math.random(1,32)
@@ -712,6 +1014,218 @@ function cunntest.SpatialConvolutionMM_backward_batch()
    mytester:assertlt(berror:abs():max(), precision_backward, 'error on bias (backward) ')
 end
 
+function cunntest.SpatialConvolutionLocal_forward_single()
+   local from = math.random(1,32)
+   local to = math.random(1,8) * 8
+   local ki = math.random(3,15)
+   local kj = math.random(3,15)
+   local si = math.random(1,3)
+   local sj = math.random(1,3)
+   local outi = math.random(1,64)
+   local outj = math.random(1,64)
+   local padW = math.random(0,1)
+   local padH = math.random(0,1)
+   local ini = (outi-1)*si+ki-padW*2
+   local inj = (outj-1)*sj+kj-padH*2
+
+   local tm = {}
+   local title = string.format('SpatialConvolutionLocal.forward %dx%dx%d o %dx%d -> %dx%dx%d [s: %dx%d] [p: %dx%d]',
+                               from, inj, ini, kj, ki, to, outj, outi, sj, si, padH, padW)
+   times[title] = tm
+
+   local input = torch.randn(from,inj,ini)
+   local sconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH)
+   local groundtruth = sconv:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = sconv:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH):cuda()
+   gconv.weight = sconv.weight:cuda()
+   gconv.bias = sconv.bias:cuda()
+   local rescuda = gconv:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gconv:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward) ')
+end
+
+function cunntest.SpatialConvolutionLocal_forward_batch()
+   local bs = math.random(1,4) * 4
+   local from = math.random(1,32)
+   local to = math.random(1,8) * 8
+   local ki = math.random(3,15)
+   local kj = math.random(3,15)
+   local si = math.random(1,3)
+   local sj = math.random(1,3)
+   local outi = math.random(1,64)
+   local outj = math.random(1,64)
+   local padW = math.random(0,1)
+   local padH = math.random(0,1)
+   local ini = (outi-1)*si+ki-padW*2
+   local inj = (outj-1)*sj+kj-padH*2
+
+   local tm = {}
+   local title = string.format('SpatialConvolutionLocal.forward %dx%dx%dx%d o %dx%d -> %dx%dx%dx%d [s: %dx%d] [p: %dx%d]',
+                               bs, from, inj, ini, kj, ki, bs, to, outj, outi, sj, si, padH, padW)
+   times[title] = tm
+
+   local input = torch.randn(bs,from,inj,ini)
+   local sconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH)
+   local groundtruth = sconv:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = sconv:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH):cuda()
+   gconv.weight = sconv.weight:cuda()
+   gconv.bias = sconv.bias:cuda()
+   local rescuda = gconv:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gconv:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward) ')
+end
+
+function cunntest.SpatialConvolutionLocal_backward_single()
+   local from = math.random(1,32)
+   local to = math.random(1,8) * 8
+   local ki = math.random(3,15)
+   local kj = math.random(3,15)
+   local si = math.random(1,3)
+   local sj = math.random(1,3)
+   local outi = math.random(1,64)
+   local outj = math.random(1,64)
+   local padW = math.random(0,1)
+   local padH = math.random(0,1)
+   local ini = (outi-1)*si+ki-padW*2
+   local inj = (outj-1)*sj+kj-padH*2
+
+   local tm = {}
+   local title = string.format('SpatialConvolutionLocal.backward %dx%dx%d o %dx%d -> %dx%dx%d [s: %dx%d] [p: %dx%d]',
+                               from, inj, ini, kj, ki, to, outj, outi, sj, si, padH, padW)
+   times[title] = tm
+
+   local input = torch.randn(from,inj,ini)
+   local gradOutput = torch.randn(to,outj,outi)
+   local sconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH)
+   sconv:forward(input)
+   sconv:zeroGradParameters()
+   local groundgrad = sconv:backward(input, gradOutput)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      sconv:zeroGradParameters()
+      groundgrad = sconv:backward(input, gradOutput)
+   end
+   local groundweight = sconv.gradWeight
+   local groundbias = sconv.gradBias
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   gradOutput = gradOutput:cuda()
+   local gconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH):cuda()
+   gconv.weight = sconv.weight:cuda()
+   gconv.bias = sconv.bias:cuda()
+   gconv:forward(input)
+   gconv:zeroGradParameters()
+   local rescuda = gconv:backward(input, gradOutput)
+   a:reset()
+   for i = 1,nloop do
+      gconv:zeroGradParameters()
+      rescuda = gconv:backward(input, gradOutput)
+   end
+   local weightcuda = gconv.gradWeight
+   local biascuda = gconv.gradBias
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundgrad
+   local werror = weightcuda:float() - groundweight
+   local berror = biascuda:float() - groundbias
+
+   mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
+   mytester:assertlt(werror:abs():max(), precision_backward, 'error on weight (backward) ')
+   mytester:assertlt(berror:abs():max(), precision_backward, 'error on bias (backward) ')
+end
+
+function cunntest.SpatialConvolutionLocal_backward_batch()
+   local bs = math.random(1,4) * 4
+   local from = math.random(1,32)
+   local to = math.random(1,8) * 8
+   local ki = math.random(3,15)
+   local kj = math.random(3,15)
+   local si = math.random(1,3)
+   local sj = math.random(1,3)
+   local outi = math.random(1,64)
+   local outj = math.random(1,64)
+   local padW = math.random(0,1)
+   local padH = math.random(0,1)
+   local ini = (outi-1)*si+ki-padW*2
+   local inj = (outj-1)*sj+kj-padH*2
+
+   local tm = {}
+   local title = string.format('SpatialConvolutionLocal.backward %dx%dx%dx%d o %dx%d -> %dx%dx%dx%d [s: %dx%d] [p: %dx%d]',
+                               bs, from, inj, ini, kj, ki, bs, to, outj, outi, sj, si, padH, padW)
+   times[title] = tm
+
+   local input = torch.randn(bs,from,inj,ini)
+   local gradOutput = torch.randn(bs,to,outj,outi)
+   local sconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH)
+   sconv:forward(input)
+   sconv:zeroGradParameters()
+   local groundgrad = sconv:backward(input, gradOutput)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      sconv:zeroGradParameters()
+      groundgrad = sconv:backward(input, gradOutput)
+   end
+   local groundweight = sconv.gradWeight
+   local groundbias = sconv.gradBias
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   gradOutput = gradOutput:cuda()
+   local gconv = nn.SpatialConvolutionLocal(from,to,ini,inj,ki,kj,si,sj,padW,padH):cuda()
+   gconv.weight = sconv.weight:cuda()
+   gconv.bias = sconv.bias:cuda()
+   gconv:forward(input)
+   gconv:zeroGradParameters()
+   local rescuda = gconv:backward(input, gradOutput)
+   a:reset()
+   for i = 1,nloop do
+      gconv:zeroGradParameters()
+      rescuda = gconv:backward(input, gradOutput)
+   end
+   local weightcuda = gconv.gradWeight
+   local biascuda = gconv.gradBias
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundgrad
+   local werror = weightcuda:float() - groundweight
+   local berror = biascuda:float() - groundbias
+
+   mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
+   mytester:assertlt(werror:abs():max(), precision_backward, 'error on weight (backward) ')
+   mytester:assertlt(berror:abs():max(), precision_backward, 'error on bias (backward) ')
+end
+
 function cunntest.SpatialFullConvolution_forward_single()
    local from = math.random(1,32)
    local to = math.random(1,8) * 8
@@ -721,20 +1235,22 @@ function cunntest.SpatialFullConvolution_forward_single()
    local sj = math.random(1,3)
    local padW = math.random(0,1)
    local padH = math.random(0,1)
-   local outi = math.random((ki - si - 2 * padW) + 1, 64)
-   local outj = math.random((kj - sj - 2 * padH) + 1, 64)
-   local ini = math.ceil((outi + 2 * padW - ki) / si + 1)
-   local inj = math.ceil((outj + 2 * padH - kj) / sj + 1)
+   local outi = math.random(ki, 64)
+   local outj = math.random(kj, 64)
+   local adjW = (outi + padW*2 - ki) % si
+   local adjH = (outj + padH*2 - kj) % sj
+   local ini = math.floor((outi + 2 * padW - ki) / si + 1)
+   local inj = math.floor((outj + 2 * padH - kj) / sj + 1)
 
    local tm = {}
    local title =
       string.format('SpatialFullConvolution.forward %dx%dx%d o %dx%d '
-                       .. '-> %dx%dx%d [s: %dx%d] [p: %dx%d]',
-                    from, inj, ini, kj, ki, to, outj, outi, sj, si, padH, padW)
+                       .. '-> %dx%dx%d [s: %dx%d] [p: %dx%d] [a: %dx%d]',
+                    from, inj, ini, kj, ki, to, outj, outi, sj, si, padH, padW, adjH, adjW)
    times[title] = tm
 
    local input = torch.randn(from,inj,ini)
-   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH)
+   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH)
    local groundtruth = sconv:forward(input)
    local a = torch.Timer()
    for i = 1,nloop do
@@ -743,7 +1259,7 @@ function cunntest.SpatialFullConvolution_forward_single()
    tm.cpu = a:time().real
 
    input = input:cuda()
-   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH):cuda()
+   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH):cuda()
    gconv.weight = sconv.weight:cuda()
    gconv.bias = sconv.bias:cuda()
    local rescuda = gconv:forward(input)
@@ -768,18 +1284,20 @@ function cunntest.SpatialFullConvolution_forward_batch()
    local sj = math.random(1,3)
    local padW = math.random(0,1)
    local padH = math.random(0,1)
-   local outi = math.random((ki - si - 2 * padW) + 1, 64)
-   local outj = math.random((kj - sj - 2 * padH) + 1, 64)
-   local ini = math.ceil((outi + 2 * padW - ki) / si + 1)
-   local inj = math.ceil((outj + 2 * padH - kj) / sj + 1)
+   local outi = math.random(ki, 64)
+   local outj = math.random(kj, 64)
+   local adjW = (outi + padW*2 - ki) % si
+   local adjH = (outj + padH*2 - kj) % sj
+   local ini = math.floor((outi + 2 * padW - ki) / si + 1)
+   local inj = math.floor((outj + 2 * padH - kj) / sj + 1)
 
    local tm = {}
-   local title = string.format('SpatialFullConvolution.forward %dx%dx%dx%d o %dx%d -> %dx%dx%dx%d [s: %dx%d] [p: %dx%d]',
-                               bs, from, inj, ini, kj, ki, bs, to, outj, outi, sj, si, padH, padW)
+   local title = string.format('SpatialFullConvolution.forward %dx%dx%dx%d o %dx%d -> %dx%dx%dx%d [s: %dx%d] [p: %dx%d] [a: %dx%d]',
+                               bs, from, inj, ini, kj, ki, bs, to, outj, outi, sj, si, padH, padW, adjH, adjW)
    times[title] = tm
 
    local input = torch.randn(bs,from,inj,ini)
-   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH)
+   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH)
    local groundtruth = sconv:forward(input)
    local a = torch.Timer()
    for i = 1,nloop do
@@ -788,7 +1306,7 @@ function cunntest.SpatialFullConvolution_forward_batch()
    tm.cpu = a:time().real
 
    input = input:cuda()
-   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH):cuda()
+   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH):cuda()
    gconv.weight = sconv.weight:cuda()
    gconv.bias = sconv.bias:cuda()
    local rescuda = gconv:forward(input)
@@ -812,18 +1330,20 @@ function cunntest.SpatialFullConvolution_backward_single()
    local sj = math.random(1,3)
    local padW = math.random(0,1)
    local padH = math.random(0,1)
-   local outi = math.random((ki - si - 2 * padW) + 1, 64)
-   local outj = math.random((kj - sj - 2 * padH) + 1, 64)
-   local ini = math.ceil((outi + 2 * padW - ki) / si + 1)
-   local inj = math.ceil((outj + 2 * padH - kj) / sj + 1)
+   local outi = math.random(ki, 64)
+   local outj = math.random(kj, 64)
+   local adjW = (outi + padW*2 - ki) % si
+   local adjH = (outj + padH*2 - kj) % sj
+   local ini = math.floor((outi + 2 * padW - ki) / si + 1)
+   local inj = math.floor((outj + 2 * padH - kj) / sj + 1)
 
    local tm = {}
-   local title = string.format('SpatialFullConvolution.backward %dx%dx%d o %dx%d -> %dx%dx%d [s: %dx%d] [p: %dx%d]',
-                               from, inj, ini, kj, ki, to, outj, outi, sj, si, padH, padW)
+   local title = string.format('SpatialFullConvolution.backward %dx%dx%d o %dx%d -> %dx%dx%d [s: %dx%d] [p: %dx%d] [a: %dx%d]',
+                               from, inj, ini, kj, ki, to, outj, outi, sj, si, padH, padW, adjH, adjW)
    times[title] = tm
 
    local input = torch.randn(from,inj,ini)
-   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH)
+   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH)
    local output = sconv:forward(input)
    local gradOutput = output:clone():normal()
    sconv:zeroGradParameters()
@@ -839,7 +1359,7 @@ function cunntest.SpatialFullConvolution_backward_single()
 
    input = input:cuda()
    gradOutput = gradOutput:cuda()
-   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH):cuda()
+   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH):cuda()
    gconv.weight = sconv.weight:cuda()
    gconv.bias = sconv.bias:cuda()
    gconv:forward(input)
@@ -874,20 +1394,22 @@ function cunntest.SpatialFullConvolution_backward_batch()
    local sj = math.random(1,3)
    local padW = math.random(0,1)
    local padH = math.random(0,1)
-   local outi = math.random((ki - si - 2 * padW) + 1, 64)
-   local outj = math.random((kj - sj - 2 * padH) + 1, 64)
-   local ini = math.ceil((outi + 2 * padW - ki) / si + 1)
-   local inj = math.ceil((outj + 2 * padH - kj) / sj + 1)
+   local outi = math.random(ki, 64)
+   local outj = math.random(kj, 64)
+   local adjW = (outi + padW*2 - ki) % si
+   local adjH = (outj + padH*2 - kj) % sj
+   local ini = math.floor((outi + 2 * padW - ki) / si + 1)
+   local inj = math.floor((outj + 2 * padH - kj) / sj + 1)
 
    local tm = {}
    local title = string.format('SpatialFullConvolution.backward %dx%dx%dx%d o %dx%d '
-                                  .. '-> %dx%dx%dx%d [s: %dx%d] [p: %dx%d]',
+                                  .. '-> %dx%dx%dx%d [s: %dx%d] [p: %dx%d] [a: %dx%d]',
                                bs, from, inj, ini, kj, ki,
-                               bs, to, outj, outi, sj, si, padH, padW)
+                               bs, to, outj, outi, sj, si, padH, padW, adjH, adjW)
    times[title] = tm
 
    local input = torch.randn(bs,from,inj,ini)
-   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH)
+   local sconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH)
    local output = sconv:forward(input)
    local gradOutput = output:clone():normal()
    sconv:zeroGradParameters()
@@ -903,7 +1425,7 @@ function cunntest.SpatialFullConvolution_backward_batch()
 
    input = input:cuda()
    gradOutput = gradOutput:cuda()
-   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH):cuda()
+   local gconv = nn.SpatialFullConvolution(from,to,ki,kj,si,sj,padW,padH,adjW,adjH):cuda()
    gconv.weight = sconv.weight:cuda()
    gconv.bias = sconv.bias:cuda()
    gconv:forward(input)
@@ -1225,6 +1747,59 @@ function cunntest.SpatialMaxPooling_forward_batch()
    mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward) ')
 end
 
+function cunntest.SpatialMaxUnpooling_forward_batch()
+   local bs = math.random(4,10)
+   local from = math.random(1,64)
+   local to = from
+   local ki = math.random(2,4)
+   local kj = math.random(2,4)
+   local si = ki
+   local sj = kj
+   local outi = math.random(32,256)
+   local outj = math.random(32,256)
+   local padi = math.random(0,ki/2-1)
+   local padj = math.random(0,kj/2-1)
+   local ceil_mode = math.random(0,1) == 1
+   local fun = ceil_mode and torch.ceil or torch.floor
+   local ini = fun((outi + padi*2 - ki)/si) +1
+   local inj = fun((outj + padj*2 - kj)/sj) +1
+
+   local tm = {}
+   local title = string.format('SpatialMaxUnpooling.forward %dx%dx%dx%d o %dx%d -> %dx%dx%dx%d',
+                               bs, from, inj, ini, kj, ki, bs, to, outj, outi)
+   times[title] = tm
+
+   local pooler = nn.SpatialMaxPooling(ki,kj,si,sj,padi,padj)
+   if ceil_mode then pooler:ceil() end
+   local sunpool = nn.SpatialMaxUnpooling(pooler)
+
+   local original = torch.randn(bs,from,outj,outi)
+   local input = pooler:forward(original)
+   local groundtruth = sunpool:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = sunpool:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   original = original:cuda()
+   pooler = nn.SpatialMaxPooling(ki,kj,si,sj,padi,padj):cuda()
+   if ceil_mode then pooler:ceil() end
+   local gunpool = nn.SpatialMaxUnpooling(pooler):cuda()
+
+   input = pooler:forward(original)
+   local rescuda = gunpool:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gunpool:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward) ')
+end
+
 function cunntest.SpatialMaxPooling_backward()
    local from = math.random(1,64)
    local to = from
@@ -1334,6 +1909,68 @@ function cunntest.SpatialMaxPooling_backward_batch()
    mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
 end
 
+function cunntest.SpatialMaxUnpooling_backward_batch()
+   local bs = math.random(4,10)
+   local from = math.random(1,64)
+   local to = from
+   local ki = math.random(2,4)
+   local kj = math.random(2,4)
+   local si = ki
+   local sj = kj
+   local outi = math.random(32,256)
+   local outj = math.random(32,256)
+   local padi = math.random(0,ki/2-1)
+   local padj = math.random(0,kj/2-1)
+   local ceil_mode = math.random(0,1) == 1
+   local fun = ceil_mode and torch.ceil or torch.floor
+   local ini = fun((outi + padi*2 - ki)/si) +1
+   local inj = fun((outj + padj*2 - kj)/sj) +1
+
+   local tm = {}
+   local title = string.format('SpatialMaxUnpooling.backward %dx%dx%dx%d o %dx%d -> %dx%dx%dx%d',
+                               bs, from, inj, ini, kj, ki, bs, to, outj, outi)
+   times[title] = tm
+
+   local pooler = nn.SpatialMaxPooling(ki,kj,si,sj,padi,padj)
+   if ceil_mode then pooler:ceil() end
+   local sunpool = nn.SpatialMaxUnpooling(pooler)
+
+   local original = torch.randn(bs,from,outj,outi)
+   local input = pooler:forward(original)
+   local gradOutput = torch.randn(original:size())
+   sunpool:forward(input)
+   sunpool:zeroGradParameters()
+   local groundgrad = sunpool:backward(input, gradOutput)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      sunpool:zeroGradParameters()
+      groundgrad = sunpool:backward(input, gradOutput)
+   end
+   tm.cpu = a:time().real
+
+   pooler = nn.SpatialMaxPooling(ki,kj,si,sj,padi,padj):cuda()
+   if ceil_mode then pooler:ceil() end
+   local gunpool = nn.SpatialMaxUnpooling(pooler):cuda()
+
+   original = original:cuda()
+   input = pooler:forward(original)
+   gunpool:forward(input)
+
+   gradOutput = gradOutput:cuda()
+   gunpool:zeroGradParameters()
+   local rescuda = gunpool:backward(input, gradOutput)
+   a:reset()
+   for i = 1,nloop do
+      gunpool:zeroGradParameters()
+      rescuda = gunpool:backward(input, gradOutput)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundgrad
+
+   mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
+end
 
 function cunntest.SpatialFractionalMaxPooling_forward()
     local batch = math.random(1, 3)
@@ -1495,7 +2132,7 @@ function cunntest.SpatialAveragePooling_includepad()
    input[1][1][1][1] = 3
    local out_noinclude = net_no_include_pad:forward(input)
    local out_include = net_include_pad:forward(input)
-   
+
    local noinc_out = out_noinclude[1][1][1][1]
    local inc_out = out_include[1][1][1][1]
    mytester:assertne(noinc_out, inc_out)
@@ -1617,7 +2254,7 @@ function cunntest.SpatialAveragePooling_backward()
    local count_exclude_pad = math.random(0,1) == 1
 
    local tm = {}
-   local title = string.format('SpatialMaxPooling.backward %dx%dx%d o %dx%d -> %dx%dx%d',
+   local title = string.format('SpatialAveragePooling.backward %dx%dx%d o %dx%d -> %dx%dx%d',
                                from, inj, ini, kj, ki, to, outj, outi)
    times[title] = tm
 
@@ -2091,6 +2728,87 @@ function cunntest.MarginCriterion_forward()
   mytester:assertlt(errorVal, precision_forward, 'error on state (forward) ')
 end
 
+function cunntest.SpatialCrossMapLRN_forward_batch()
+   local bs = math.random(4,10)
+   local inputSize = math.random(6,9)
+   local size = math.random(1,3)*2+1
+   local nbfeatures = math.random(3,8)
+   local alpha = math.random(1,100)/100
+   local beta  = math.random(0,100)/100
+   local k = math.random(1,3)
+
+   local tm = {}
+   local title = string.format('SpatialCrossMapLRN.forward')
+   times[title] = tm
+
+   local input = torch.rand(bs, nbfeatures, inputSize, inputSize)
+   local sconv = nn.SpatialCrossMapLRN(size, alpha, beta, k)
+   local groundtruth = sconv:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = sconv:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gconv = nn.SpatialCrossMapLRN(size, alpha, beta, k):cuda()
+   local rescuda = gconv:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gconv:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward) ')
+end
+
+function cunntest.SpatialCrossMapLRN_backward_batch()
+   local bs = math.random(4,10)
+   local inputSize = math.random(6,9)
+   local size = math.random(1,3)*2+1
+   local nbfeatures = math.random(3,8)
+   local alpha = math.random(1,100)/100
+   local beta  = math.random(0,100)/100
+   local k = math.random(1,3)
+
+   local tm = {}
+   local title = string.format('SpatialCrossMapLRN.backward')
+   times[title] = tm
+
+   local input = torch.rand(bs, nbfeatures, inputSize, inputSize)
+   local gradOutput = torch.rand(input:size())
+   local sconv = nn.SpatialCrossMapLRN(size, alpha, beta, k)
+   sconv:forward(input)
+   sconv:zeroGradParameters()
+   local groundgrad = sconv:backward(input, gradOutput)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      sconv:zeroGradParameters()
+      groundgrad = sconv:backward(input, gradOutput)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   gradOutput = gradOutput:cuda()
+   local gconv = nn.SpatialCrossMapLRN(size, alpha, beta, k):cuda()
+   gconv:forward(input)
+   gconv:zeroGradParameters()
+   local rescuda = gconv:backward(input, gradOutput)
+   a:reset()
+   for i = 1,nloop do
+      gconv:zeroGradParameters()
+      rescuda = gconv:backward(input, gradOutput)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundgrad
+
+   mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
+end
+
 function cunntest.MarginCriterion_backward()
    local size = math.random(1,100)
 
@@ -2152,26 +2870,9 @@ function cunntest.mse()
       cutorch.synchronize()
       tm.gpu = a:time().real
 
-      local tm2 = {}
-      local title = string.format('MSECriterion2 sizeAverage %d, %d ',sizeAverage, size)
-      times[title] = tm2
-      tm2.cpu = tm.cpu
-      local cinput2 = input:cuda()
-      local ctarget2 = target:cuda()
-      local cmod2 = nn.MSECriterion(sizeAverage == 1):cuda()
-      a:reset()
-      local cout2 = cinput2.nn.MSECriterion_updateOutput2(cmod,cinput2,ctarget2)
-      local cgin2 = cinput2.nn.MSECriterion_updateGradInput2(cmod,cinput2,ctarget2)
-      cutorch.synchronize()
-      tm2.gpu = a:time().real
-
       mytester:assertlt(math.abs(fout-cout), 0.02, 'error  on output')
       local gerr = cgin:float() - fgin
       mytester:assertlt(gerr:abs():max(), precision_forward, 'error  on gradInput')
-
-      mytester:assertlt(math.abs(fout-cout2), 0.02, 'error  on output - 2')
-      local gerr2 = cgin2:float() - fgin
-      mytester:assertlt(gerr2:abs():max(), precision_forward, 'error  on gradInput -2')
    end
 end
 
@@ -2205,6 +2906,38 @@ function cunntest.SmoothL1()
       mytester:assertlt(gerr:abs():max(), precision_forward, 'error  on gradInput')
    end
 end
+
+function cunntest.SoftMarginCriterion()
+   for sizeAverage = 0, 1 do
+      local size = math.random(3000,5000)
+      local input = torch.randn(size,1,1)
+      local target = torch.randn(size)
+      local mod = nn.SoftMarginCriterion(sizeAverage == 1)
+
+      local tm = {}
+      local title = string.format('SoftMarginCriterion sizeAverage %d, %d ', sizeAverage, size)
+      times[title] = tm
+
+      local a = torch.Timer()
+      local fout = mod:forward(input,target)
+      local fgin = mod:backward(input,target):clone()
+      tm.cpu = a:time().real
+
+      local cinput = input:cuda()
+      local ctarget = target:cuda()
+      local cmod = nn.SoftMarginCriterion(sizeAverage == 1):cuda()
+      a:reset()
+      local cout = cmod:forward(cinput,ctarget)
+      local cgin = cmod:backward(cinput,ctarget)
+      cutorch.synchronize()
+      tm.gpu = a:time().real
+
+      mytester:assertlt(math.abs(fout-cout), 0.01, 'error  on output')
+      local gerr = cgin:float() - fgin
+      mytester:assertlt(gerr:abs():max(), precision_forward, 'error  on gradInput')
+   end
+end
+
 
 function cunntest.distkldiv()
    for sizeAverage = 0, 1 do
@@ -2896,9 +3629,9 @@ function cunntest.VolumetricConvolution_forward_single()
    local si = math.random(1,ki)
    local sj = math.random(1,kj)
    local sk = math.random(1,kk)
-   local outi = math.random(1,64)
-   local outj = math.random(1,64)
-   local outk = math.random(1,64)
+   local outi = math.random(1,20)
+   local outj = math.random(1,20)
+   local outk = math.random(1,20)
    local ini = (outi-1)*si+ki
    local inj = (outj-1)*sj+kj
    local ink = (outk-1)*sk+kk
@@ -3114,21 +3847,24 @@ function cunntest.VolumetricMaxPooling_forward()
    local dT = math.random(1, 13)
    local dH = math.random(1, 13)
    local dW = math.random(1, 13)
-   local oT = math.random(1, 64)
-   local oH = math.random(1, 64)
-   local oW = math.random(1, 64)
+   local oT = math.random(1, 20)
+   local oH = math.random(1, 20)
+   local oW = math.random(1, 20)
+   local padT = math.random(0,kT/2-1)
+   local padH = math.random(0,kH/2-1)
+   local padW = math.random(0,kW/2-1)
    local iF = math.random(1, 16) -- features
-   local iT = (oT - 1) * dT + kT
-   local iH = (oH - 1) * dH + kH
-   local iW = (oW - 1) * dW + kW
+   local iT = (oT - 1) * dT + kT - padT*2
+   local iH = (oH - 1) * dH + kH - padH*2
+   local iW = (oW - 1) * dW + kW - padW*2
 
    local tm = {}
-   local title = string.format('VolumetricMaxPooling.forward %dx%dx%dx%d o %dx%dx%d -> %dx%dx%dx%d',
-                           iF, iT, iH, iW, kT, kH, kW, iF, oT, oH, oW)
+   local title = string.format('VolumetricMaxPooling.forward %dx%dx%dx%d o %dx%dx%d (%dx%dx%d)-> %dx%dx%dx%d',
+                           iF, iT, iH, iW, kT, kH, kW, dT, dH, dW, iF, oT, oH, oW)
    times[title] = tm
 
    local input = torch.Tensor(iF, iT, iH, iW):float():uniform(-1, 1)
-   local layer = nn.VolumetricMaxPooling(kT, kH, kW, dT, dH, dW):float()
+   local layer = nn.VolumetricMaxPooling(kT, kH, kW, dT, dH, dW, padT, padH, padW):float()
    local output = layer:forward(input)
    local timer = torch.Timer()
    for i = 1,nloop do
@@ -3157,21 +3893,24 @@ function cunntest.VolumetricMaxPooling_backward()
    local dT = math.random(1, 13)
    local dH = math.random(1, 13)
    local dW = math.random(1, 13)
-   local oT = math.random(1, 64)
-   local oH = math.random(1, 64)
-   local oW = math.random(1, 64)
+   local oT = math.random(1, 20)
+   local oH = math.random(1, 20)
+   local oW = math.random(1, 20)
+   local padT = math.random(0,kT/2-1)
+   local padH = math.random(0,kH/2-1)
+   local padW = math.random(0,kW/2-1)
    local iF = math.random(1, 16) -- features
-   local iT = (oT - 1) * dT + kT
-   local iH = (oH - 1) * dH + kH
-   local iW = (oW - 1) * dW + kW
+   local iT = (oT - 1) * dT + kT - padT*2
+   local iH = (oH - 1) * dH + kH - padH*2
+   local iW = (oW - 1) * dW + kW - padW*2
 
    local tm = {}
-   local title = string.format('VolumetricMaxPooling.backward %dx%dx%dx%d o %dx%dx%d -> %dx%dx%dx%d',
-                               iF, iT, iH, iW, kT, kH, kW, iF, oT, oH, oW)
+   local title = string.format('VolumetricMaxPooling.backward %dx%dx%dx%d o %dx%dx%d (%dx%dx%d) -> %dx%dx%dx%d',
+                               iF, iT, iH, iW, kT, kH, kW, dT, dH, dW, iF, oT, oH, oW)
    times[title] = tm
 
    local input = torch.Tensor(iF, iT, iH, iW):float():uniform(-1, 1)
-   local layer = nn.VolumetricMaxPooling(kT, kH, kW, dT, dH, dW):float()
+   local layer = nn.VolumetricMaxPooling(kT, kH, kW, dT, dH, dW, padT, padH, padW):float()
    local output = layer:forward(input)
    local gradOutput = output:clone():uniform(-1, 1)
 
@@ -3206,17 +3945,17 @@ function cunntest.VolumetricAveragePooling_forward()
    local dT = math.random(1, 13)
    local dH = math.random(1, 13)
    local dW = math.random(1, 13)
-   local oT = math.random(1, 64)
-   local oH = math.random(1, 64)
-   local oW = math.random(1, 64)
+   local oT = math.random(1, 20)
+   local oH = math.random(1, 20)
+   local oW = math.random(1, 20)
    local iF = math.random(1, 16) -- features
    local iT = (oT - 1) * dT + kT
    local iH = (oH - 1) * dH + kH
    local iW = (oW - 1) * dW + kW
 
    local tm = {}
-   local title = string.format('VolumetricAveragePooling.forward %dx%dx%dx%d o %dx%dx%d -> %dx%dx%dx%d',
-                               iF, iT, iH, iW, kT, kH, kW, iF, oT, oH, oW)
+   local title = string.format('VolumetricAveragePooling.forward %dx%dx%dx%d o %dx%dx%d (%dx%dx%d) -> %dx%dx%dx%d',
+                               iF, iT, iH, iW, kT, kH, kW, dT, dH, dW, iF, oT, oH, oW)
    times[title] = tm
 
    local input = torch.Tensor(iF, iT, iH, iW):float():uniform(-1, 1)
@@ -3249,17 +3988,17 @@ function cunntest.VolumetricAveragePooling_backward()
    local dT = math.random(1, 13)
    local dH = math.random(1, 13)
    local dW = math.random(1, 13)
-   local oT = math.random(1, 64)
-   local oH = math.random(1, 64)
-   local oW = math.random(1, 64)
+   local oT = math.random(1, 20)
+   local oH = math.random(1, 20)
+   local oW = math.random(1, 20)
    local iF = math.random(1, 16) -- features
    local iT = (oT - 1) * dT + kT
    local iH = (oH - 1) * dH + kH
    local iW = (oW - 1) * dW + kW
 
    local tm = {}
-   local title = string.format('VolumetricAveragePooling.backward %dx%dx%dx%d o %dx%dx%d -> %dx%dx%dx%d',
-                           iF, iT, iH, iW, kT, kH, kW, iF, oT, oH, oW)
+   local title = string.format('VolumetricAveragePooling.backward %dx%dx%dx%d o %dx%dx%d (%dx%dx%d) -> %dx%dx%dx%d',
+                           iF, iT, iH, iW, kT, kH, kW, dT, dH, dW, iF, oT, oH, oW)
    times[title] = tm
 
    local input = torch.Tensor(iF, iT, iH, iW):float():uniform(-1, 1)
@@ -3605,6 +4344,7 @@ function cunntest.VolumetricFullConvolution()
         end
     end
 
+    module:zeroGradParameters()
     local gradOut = torch.Tensor(1, 1, 6, 6, 6):fill(0.1);
     local gradIn = module:backward(input:cuda(), gradOut:cuda())
     for t = 1,2 do
@@ -3622,7 +4362,7 @@ function cunntest.VolumetricFullConvolution()
         for t = 1,3 do
             for h = 1,3 do
                 for w = 1,3 do
-                    mytester:assertlt(module.gradWeight[1][c][t][h][w] - 0.1, precision_backward,
+                    mytester:assertlt(module.gradWeight[c][1][t][h][w] - 0.1, precision_backward,
                                       'error on backward weight gradients ')
                 end
             end
@@ -3674,45 +4414,57 @@ function cunntest.LookupTable_forward()
 end
 
 function cunntest.LookupTable_backward()
-   local nVocab = 10000
+   local grid = {
+      nInput = {10, 101, 1000, 10007},
+      nVocab = {100, 10000},
+      nDim = {97, 255},
+      scaleGradByFreq = {false, true},
+      batch = {false, true},
+      paddingValue = {0, 1},
+   }
 
-   for _,nDim in ipairs{97,255} do
-      for _,nInput in ipairs{10,101,1000,10007} do
-         for _,scaleGradByFreq in ipairs{false,true} do
-            for _,batch in ipairs{false, true} do
-               local input, gradOutput
-               if batch then
-                  input = torch.LongTensor(nInput, 5):random(nVocab)
-                  gradOutput = torch.randn(nInput, 5, nDim)
-               else
-                  input = torch.LongTensor(nInput):random(nVocab)
-                  gradOutput = torch.randn(nInput, nDim)
-               end
-
-               local sconv = nn.LookupTable(nVocab, nDim)
-               local gconv = sconv:clone():cuda()
-               if scaleGradByFreq then
-                  sconv = sconv:scaleGradByFreq()
-                  gconv = gconv:scaleGradByFreq()
-               end
-
-               sconv:forward(input)
-               sconv:backward(input, gradOutput)
-
-               input = input:cuda()
-               gradOutput = gradOutput:cuda()
-               gconv:forward(input)
-               gconv:backward(input, gradOutput)
-
-               local weightGradError = gconv.gradWeight:float() - sconv.gradWeight
-               mytester:assertlt(weightGradError:abs():max(), precision_backward,
-                  'error on weight for size ' .. tostring(nInput) .. ' scaleGradByFreq: ' .. tostring(scaleGradByFreq)
-                  .. ' nDim ' .. tostring(nDim))
-            end
-         end
+   for itr = 1, 10 do
+      -- Randomly sample from grid of parameters
+      local s = {}
+      for k, v in pairs(grid) do
+         s[k] = v[torch.random(#v)]
       end
+
+      local input, gradOutput
+      if s.batch then
+         input = torch.LongTensor(s.nInput, 5):random(s.nVocab)
+         gradOutput = torch.randn(s.nInput, 5, s.nDim)
+      else
+         input = torch.LongTensor(s.nInput):random(s.nVocab)
+         gradOutput = torch.randn(s.nInput, s.nDim)
+      end
+
+      local sconv = nn.LookupTable(s.nVocab, s.nDim, s.paddingValue)
+      local gconv = sconv:clone():cuda()
+      if s.scaleGradByFreq then
+         sconv = sconv:scaleGradByFreq()
+         gconv = gconv:scaleGradByFreq()
+      end
+
+      sconv:forward(input)
+      sconv:backward(input, gradOutput)
+
+      input = input:cuda()
+      gradOutput = gradOutput:cuda()
+      gconv:forward(input)
+      gconv:backward(input, gradOutput)
+
+      local weightGradError = gconv.gradWeight:float() - sconv.gradWeight
+      mytester:assertlt(weightGradError:abs():max(), precision_backward,
+         'error on weight for size ' .. tostring(s.nInput) ..
+          ' nVocab: ' .. tostring(s.nVocab) ..
+          ' nDim ' .. tostring(s.nDim) ..
+          ' scaleGradByFreq: ' .. tostring(s.scaleGradByFreq) ..
+          ' batch: ' .. tostring(s.batch) ..
+          ' paddingValue: ' .. tostring(s.paddingValue))
    end
 
+   local nVocab = 10000
    local nDim = 128
    local nInput = 1000
    local tm = {}
@@ -3745,6 +4497,209 @@ function cunntest.LookupTable_backward()
 
    local weightGradError = gconv.gradWeight:float() - sconv.gradWeight
    mytester:assertlt(weightGradError:abs():max(), precision_backward, 'error on weight')
+end
+
+function cunntest.getParameters()
+  -- tensors are non-contiguous but compact; they can be gathered
+  local L = nn.Linear(10,10):cuda()
+  L.weight = torch.CudaTensor(10,10):t():fill(1)
+  local tmp = torch.CudaTensor(10,10):fill(2)
+  L.bias = tmp:select(1,2)
+  local P = L:getParameters()
+  mytester:asserteq(L.weight:mean(), 1)
+  mytester:asserteq(L.bias:mean(), 2)
+  mytester:asserteq(L.weight:storage(), L.bias:storage())
+  mytester:asserteq(P:nElement(), 110)
+  mytester:asserteq(P:storage():size(), 110)
+  mytester:assertlt(L.bias[{ {10} }]:storageOffset() - 1, L.bias:storage():size())
+end
+
+function cunntest.SpatialReflectionPadding_forward()
+   local batch = math.random(1,3)
+   local plane = math.random(1,3)
+   local sizeY = math.random(6,16)
+   local sizeX = math.random(6,16)
+   local padL = math.random(-3,3)
+   local padR = math.random(-3,3)
+   local padT = math.random(-3,3)
+   local padB = math.random(-3,3)
+
+   local tm = {}
+   local title =
+      string.format(
+         'SpatialReflectionPadding.forward %dx%dx%dx%d -> %dx%dx%dx%d',
+         batch, plane, sizeY, sizeX,
+         batch, plane, sizeY + padT + padB, sizeX + padL + padR)
+   times[title] = tm
+
+   local input = torch.rand(batch, plane, sizeY, sizeX)
+   local module = nn.SpatialReflectionPadding(padL, padR, padT, padB)
+   local groundtruth = module:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = module:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gmodule = nn.SpatialReflectionPadding(padL, padR, padT, padB):cuda()
+   local rescuda = gmodule:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gmodule:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(),
+                     precision_forward, 'error on state (forward) ')
+end
+
+function cunntest.SpatialReflectionPadding_backward()
+   local batch = math.random(1,3)
+   local plane = math.random(1,3)
+   local sizeY = math.random(6,16)
+   local sizeX = math.random(6,16)
+   local padL = math.random(-3,3)
+   local padR = math.random(-3,3)
+   local padT = math.random(-3,3)
+   local padB = math.random(-3,3)
+
+   local tm = {}
+   local title =
+      string.format(
+         'SpatialReflectionPadding.backward %dx%dx%dx%d -> %dx%dx%dx%d',
+         batch, plane, sizeY, sizeX,
+         batch, plane, sizeY + padT + padB, sizeX + padL + padR)
+   times[title] = tm
+
+   local input = torch.rand(batch, plane, sizeY, sizeX)
+   local gradOutput = torch.rand(
+      batch, plane, sizeY + padT + padB, sizeX + padL + padR
+   )
+   local module = nn.SpatialReflectionPadding(padL, padR, padT, padB)
+   module:forward(input)
+   module:zeroGradParameters()
+   local groundgrad = module:backward(input, gradOutput)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      module:zeroGradParameters()
+      groundgrad = module:backward(input, gradOutput)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   gradOutput = gradOutput:cuda()
+   local gmodule = nn.SpatialReflectionPadding(padL, padR, padT, padB):cuda()
+   gmodule:forward(input)
+   gmodule:zeroGradParameters()
+   local rescuda = gmodule:backward(input, gradOutput)
+   a:reset()
+   for i = 1,nloop do
+      gmodule:zeroGradParameters()
+      rescuda = gmodule:backward(input, gradOutput)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundgrad
+   mytester:assertlt(error:abs():max(),
+                     precision_backward, 'error on state (backward) ')
+end
+
+function cunntest.SpatialReplicationPadding_forward()
+   local batch = math.random(1,3)
+   local plane = math.random(1,3)
+   local sizeY = math.random(6,16)
+   local sizeX = math.random(6,16)
+   local padL = math.random(-3,3)
+   local padR = math.random(-3,3)
+   local padT = math.random(-3,3)
+   local padB = math.random(-3,3)
+
+   local tm = {}
+   local title =
+      string.format(
+         'SpatialReplicationPadding.forward %dx%dx%dx%d -> %dx%dx%dx%d',
+         batch, plane, sizeY, sizeX,
+         batch, plane, sizeY + padT + padB, sizeX + padL + padR)
+   times[title] = tm
+
+   local input = torch.rand(batch, plane, sizeY, sizeX)
+   local module = nn.SpatialReplicationPadding(padL, padR, padT, padB)
+   local groundtruth = module:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = module:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gmodule = nn.SpatialReplicationPadding(padL, padR, padT, padB):cuda()
+   local rescuda = gmodule:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gmodule:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundtruth
+   mytester:assertlt(error:abs():max(),
+                     precision_forward, 'error on state (forward) ')
+end
+
+function cunntest.SpatialReplicationPadding_backward()
+   local batch = math.random(1,3)
+   local plane = math.random(1,3)
+   local sizeY = math.random(6,16)
+   local sizeX = math.random(6,16)
+   local padL = math.random(-3,3)
+   local padR = math.random(-3,3)
+   local padT = math.random(-3,3)
+   local padB = math.random(-3,3)
+
+   local tm = {}
+   local title =
+      string.format(
+         'SpatialReplicationPadding.backward %dx%dx%dx%d -> %dx%dx%dx%d',
+         batch, plane, sizeY, sizeX,
+         batch, plane, sizeY + padT + padB, sizeX + padL + padR)
+   times[title] = tm
+
+   local input = torch.rand(batch, plane, sizeY, sizeX)
+   local gradOutput = torch.rand(
+      batch, plane, sizeY + padT + padB, sizeX + padL + padR
+   )
+   local module = nn.SpatialReplicationPadding(padL, padR, padT, padB)
+   module:forward(input)
+   module:zeroGradParameters()
+   local groundgrad = module:backward(input, gradOutput)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      module:zeroGradParameters()
+      groundgrad = module:backward(input, gradOutput)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   gradOutput = gradOutput:cuda()
+   local gmodule = nn.SpatialReplicationPadding(padL, padR, padT, padB):cuda()
+   gmodule:forward(input)
+   gmodule:zeroGradParameters()
+   local rescuda = gmodule:backward(input, gradOutput)
+   a:reset()
+   for i = 1,nloop do
+      gmodule:zeroGradParameters()
+      rescuda = gmodule:backward(input, gradOutput)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = rescuda:float() - groundgrad
+   mytester:assertlt(error:abs():max(),
+                     precision_backward, 'error on state (backward) ')
 end
 
 local function setUp()

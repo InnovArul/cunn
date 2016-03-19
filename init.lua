@@ -1,9 +1,8 @@
 require "cutorch"
 require "nn"
-require "libcunn"
+require "cunn.THCUNN"
 
-include('test.lua')
-
-include('DataParallelTable.lua')
+require('cunn.test')
+require('cunn.DataParallelTable')
 
 nn.Module._flattenTensorBuffer['torch.CudaTensor'] = torch.FloatTensor.new
