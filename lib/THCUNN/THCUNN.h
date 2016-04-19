@@ -147,6 +147,13 @@ TH_API void THNN_CudaLookupTable_accGradParameters(
           int paddingValue,
           float scale);
 
+TH_API void THNN_CudaLookupTable_renorm(
+          THCState *state,
+          THIndexTensor *idx,
+          THCudaTensor *weight,
+          float maxNorm,
+          float normType);
+
 TH_API void THNN_CudaMarginCriterion_updateOutput(
           THCState *state,
           THCudaTensor *input,
@@ -196,7 +203,8 @@ TH_API void THNN_CudaMultiMarginCriterion_updateOutput(
           THCudaTensor *output,
           bool sizeAverage,
           int p,
-          THCudaTensor *weights);
+          THCudaTensor *weights,
+          float margin);
 TH_API void THNN_CudaMultiMarginCriterion_updateGradInput(
           THCState *state,
           THCudaTensor *input,
@@ -204,7 +212,8 @@ TH_API void THNN_CudaMultiMarginCriterion_updateGradInput(
           THCudaTensor *gradInput,
           bool sizeAverage,
           int p,
-          THCudaTensor *weights);
+          THCudaTensor *weights,
+          float margin);
 
 TH_API void THNN_CudaPReLU_updateOutput(
           THCState *state,
@@ -471,9 +480,13 @@ TH_API void THNN_CudaBatchNormalization_backward(
           THCudaTensor *gradWeight,
           THCudaTensor *gradBias,
           THCudaTensor *weight,
-          THCudaTensor *saveMean,
-          THCudaTensor *saveStd,
-          float scale);
+          THCudaTensor *running_mean,
+          THCudaTensor *running_var,
+          THCudaTensor *save_mean,
+          THCudaTensor *save_std,
+          bool train,
+          float scale,
+          double eps);
 
 TH_API void THNN_CudaSpatialConvolutionMM_updateOutput(
           THCState *state,
@@ -492,7 +505,6 @@ TH_API void THNN_CudaSpatialConvolutionMM_updateGradInput(
           THCudaTensor *gradOutput,
           THCudaTensor *gradInput,
           THCudaTensor *weight,
-          THCudaTensor *bias,
           THCudaTensor *columns,
           THCudaTensor *ones,
           int kW, int kH,
